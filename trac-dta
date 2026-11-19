@@ -1,0 +1,952 @@
+
+
+from dataclasses import dataclass
+from typing import Optional, Sequence
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# 1. External architecture configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TRACDTAConfig:
+    # Input representation dimensions
+    drug_plm_dim: int
+    protein_plm_dim: int
+    drug_atom_feature_dim: int
+    protein_residue_feature_dim: int
+
+    # Shared representation dimensions
+    hidden_dim: int
+    projection_dim: int
+    pair_dim: int
+
+    # TAPC
+    prototype_count: int
+    prototype_dim: int
+
+    # Stage-2 relational branch
+    relation_dim: int
+    relation_hidden_dim: int
+    relation_head_hidden_dim: int
+    calibration_hidden_dim: int
+
+    # Architectural/training settings supplied by the experiment configuration
+    dropout: float
+    gat_negative_slope: float
+
+
+# ---------------------------------------------------------------------------
+# 2. Graph and sequence representation encoders
+# ---------------------------------------------------------------------------
+
+class RobustProjector(nn.Module):
+    """Project pretrained token representations into the shared latent space."""
+
+    def __init__(self, in_dim: int, out_dim: int, bottleneck_dim: int,
+                 dropout: float):
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, bottleneck_dim),
+            nn.GELU(),
+            nn.LayerNorm(bottleneck_dim),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, x):
+        return self.projection(x)
+
+
+class GINLayer(nn.Module):
+    """GIN-style neighborhood aggregation with a learnable self-feature weight."""
+
+    def __init__(self, in_dim: int, out_dim: int, dropout: float):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.eps = nn.Parameter(torch.zeros(()))
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(out_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x, normalized_adjacency, node_mask):
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+
+        mask = node_mask.unsqueeze(-1)
+        x = x * mask
+        neighbor_features = torch.matmul(normalized_adjacency, x)
+        aggregated = neighbor_features + self.eps * x
+
+        batch_size, node_count, feature_dim = aggregated.shape
+        out = self.mlp(aggregated.reshape(-1, feature_dim))
+        out = out.reshape(batch_size, node_count, -1)
+
+        if self.in_dim == self.out_dim:
+            out = out + x
+
+        return out * mask
+
+
+class GATLayer(nn.Module):
+    """Graph attention over adjacent nodes."""
+
+    def __init__(self, in_dim: int, out_dim: int, dropout: float,
+                 negative_slope: float):
+        super().__init__()
+        self.projection = nn.Linear(in_dim, out_dim, bias=False)
+        self.attention_left = nn.Linear(out_dim, 1, bias=False)
+        self.attention_right = nn.Linear(out_dim, 1, bias=False)
+        self.activation = nn.LeakyReLU(negative_slope)
+        self.dropout = nn.Dropout(dropout)
+        self.normalization = nn.LayerNorm(out_dim)
+        self.use_residual = in_dim == out_dim
+
+    def forward(self, x, adjacency_mask, node_mask):
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+
+        mask = node_mask.unsqueeze(-1)
+        x = x * mask
+        h = self.projection(x)
+
+        left_score = self.attention_left(h)
+        right_score = self.attention_right(h).transpose(1, 2)
+        scores = self.activation(left_score + right_score)
+
+        valid_node_pairs = (
+            node_mask.unsqueeze(1) * node_mask.unsqueeze(2)
+        ).bool()
+        allowed_edges = adjacency_mask.bool() & valid_node_pairs
+        scores = scores.masked_fill(
+            ~allowed_edges, torch.finfo(scores.dtype).min
+        )
+
+        attention = F.softmax(scores, dim=-1)
+        attention = torch.nan_to_num(attention, nan=0.0)
+        out = torch.matmul(self.dropout(attention), h)
+
+        if self.use_residual:
+            out = out + x
+
+        return self.normalization(out * mask)
+
+
+class GINGATEncoder(nn.Module):
+    """Stacked GIN and GAT layers for molecular and protein graphs."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int,
+                 dropout: float, negative_slope: float):
+        super().__init__()
+        self.gin_1 = GINLayer(in_dim, hidden_dim, dropout)
+        self.gin_2 = GINLayer(hidden_dim, hidden_dim, dropout)
+        self.gat = GATLayer(hidden_dim, out_dim, dropout, negative_slope)
+
+    def forward(self, x, normalized_adjacency, adjacency_mask, node_mask):
+        x = self.gin_1(x, normalized_adjacency, node_mask)
+        x = self.gin_2(x, normalized_adjacency, node_mask)
+        x = self.gat(x, adjacency_mask, node_mask)
+        return F.elu(x)
+
+
+class AttentionPooling(nn.Module):
+    """Mask-aware attention pooling over token or graph-node representations."""
+
+    def __init__(self, in_dim: int, hidden_dim: int):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x, mask=None):
+        scores = self.attention(x).squeeze(-1)
+        if mask is not None:
+            scores = scores.masked_fill(
+                mask == 0, torch.finfo(scores.dtype).min
+            )
+
+        weights = F.softmax(scores, dim=1).unsqueeze(-1)
+        if mask is not None:
+            weights = weights * mask.unsqueeze(-1)
+
+        return torch.sum(x * weights, dim=1)
+
+
+class BidirectionalInteractivePooling(nn.Module):
+    """
+    Context-conditioned positional pooling.
+
+    The drug-side instance uses protein context to pool drug positions; the
+    protein-side instance uses drug context to pool protein positions. The same
+    operation is applied to the pretrained-representation and graph branches.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.self_projection = nn.Linear(dim, dim)
+        self.context_projection = nn.Linear(dim, dim)
+        self.score_projection = nn.Linear(dim, 1, bias=False)
+
+    def forward(self, sequence_features, partner_context, mask=None):
+        hidden = torch.tanh(
+            self.self_projection(sequence_features)
+            + self.context_projection(partner_context).unsqueeze(1)
+        )
+        scores = self.score_projection(hidden).squeeze(-1)
+
+        if mask is not None:
+            scores = scores.masked_fill(
+                mask == 0, torch.finfo(scores.dtype).min
+            )
+
+        weights = F.softmax(scores, dim=1).unsqueeze(-1)
+        if mask is not None:
+            weights = weights * mask.unsqueeze(-1)
+
+        return torch.sum(sequence_features * weights, dim=1)
+
+
+# ---------------------------------------------------------------------------
+# 3. Stage 1: target-conditioned multimodal absolute prediction
+# ---------------------------------------------------------------------------
+
+class TargetConditionedModalityFusion(nn.Module):
+    """
+    TCMF: Target-Conditioned Modality Fusion.
+
+    For each entity, the PLM and graph representations are weighted according
+    to the multimodal context of its partner in the current drug-target pair.
+    """
+
+    def __init__(self, dim: int, dropout: float):
+        super().__init__()
+        self.context_network = nn.Sequential(
+            nn.LayerNorm(dim * 2),
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+
+        self.plm_norm = nn.LayerNorm(dim)
+        self.graph_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
+
+        self.plm_score = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, 1),
+        )
+        self.graph_score = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, 1),
+        )
+
+        self.cross_modal_interaction = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+        )
+        self.interaction_scale = nn.Parameter(torch.zeros(()))
+        self.output_norm = nn.LayerNorm(dim)
+
+    def forward(self, plm_vector, graph_vector,
+                partner_plm_context, partner_graph_context):
+        context = self.context_network(
+            torch.cat([partner_plm_context, partner_graph_context], dim=-1)
+        )
+
+        plm = self.plm_norm(plm_vector)
+        graph = self.graph_norm(graph_vector)
+        context = self.context_norm(context)
+
+        plm_score = self.plm_score(torch.cat([plm, context], dim=-1))
+        graph_score = self.graph_score(torch.cat([graph, context], dim=-1))
+        modality_weights = F.softmax(
+            torch.cat([plm_score, graph_score], dim=-1), dim=-1
+        )
+
+        fused = (
+            modality_weights[:, :1] * plm_vector
+            + modality_weights[:, 1:] * graph_vector
+        )
+
+        interaction = self.cross_modal_interaction(plm * graph)
+        fused = fused + torch.tanh(self.interaction_scale) * interaction
+        return self.output_norm(fused)
+
+
+class TargetAwarePrototypeCalibration(nn.Module):
+    """
+    TAPC: Target-Aware Prototype Calibration.
+
+    A shared latent prototype bank is conditioned on the current protein
+    representation before the drug-target pair retrieves prototype context.
+    The retrieved context then calibrates the pair representation residually.
+    """
+
+    def __init__(self, pair_dim: int, target_dim: int, config: TRACDTAConfig):
+        super().__init__()
+        self.prototype_dim = config.prototype_dim
+        self.prototypes = nn.Parameter(
+            torch.empty(config.prototype_count, config.prototype_dim)
+        )
+        nn.init.xavier_uniform_(self.prototypes)
+
+        self.pair_norm = nn.LayerNorm(pair_dim)
+        self.target_norm = nn.LayerNorm(target_dim)
+        self.query_projection = nn.Linear(
+            pair_dim, config.prototype_dim, bias=False
+        )
+        self.key_projection = nn.Linear(
+            config.prototype_dim, config.prototype_dim, bias=False
+        )
+
+        self.target_conditioner = nn.Sequential(
+            nn.Linear(target_dim, config.prototype_dim * 2),
+            nn.GELU(),
+            nn.Linear(config.prototype_dim * 2, config.prototype_dim * 2),
+        )
+
+        self.context_projection = nn.Sequential(
+            nn.LayerNorm(config.prototype_dim),
+            nn.Linear(config.prototype_dim, pair_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(pair_dim, pair_dim),
+        )
+        self.calibration_network = nn.Sequential(
+            nn.LayerNorm(pair_dim * 2),
+            nn.Linear(pair_dim * 2, pair_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(pair_dim, pair_dim),
+        )
+        self.residual_scale = nn.Parameter(torch.zeros(()))
+
+    def forward(self, pair_representation, target_representation):
+        query = self.query_projection(
+            self.pair_norm(pair_representation)
+        )
+
+        gamma, beta = self.target_conditioner(
+            self.target_norm(target_representation)
+        ).chunk(2, dim=-1)
+        gamma = torch.tanh(gamma)
+        beta = torch.tanh(beta)
+
+        base_prototypes = self.prototypes.unsqueeze(0)
+        conditioned_prototypes = (
+            (1.0 + gamma.unsqueeze(1)) * base_prototypes
+            + beta.unsqueeze(1)
+        )
+
+        keys = self.key_projection(conditioned_prototypes)
+        scores = (
+            query.unsqueeze(1) * keys
+        ).sum(dim=-1) / (self.prototype_dim ** 0.5)
+
+        attention = F.softmax(scores, dim=-1)
+        prototype_context = (
+            attention.unsqueeze(-1) * conditioned_prototypes
+        ).sum(dim=1)
+
+        context = self.context_projection(prototype_context)
+        update = self.calibration_network(
+            torch.cat([pair_representation, context], dim=-1)
+        )
+        return pair_representation + torch.tanh(self.residual_scale) * update
+
+
+class InteractionAwarePairFusion(nn.Module):
+    """Fuse drug and protein vectors with interaction features and a residual gate."""
+
+    def __init__(self, dim: int, out_dim: int, dropout: float):
+        super().__init__()
+        interaction_dim = dim * 4
+
+        self.interaction_projection = nn.Sequential(
+            nn.LayerNorm(interaction_dim),
+            nn.Linear(interaction_dim, out_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(interaction_dim, out_dim),
+            nn.Sigmoid(),
+        )
+        self.skip_projection = nn.Linear(dim * 2, out_dim)
+        self.output_network = nn.Sequential(
+            nn.Linear(out_dim, out_dim),
+            nn.GELU(),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, drug_vector, protein_vector):
+        pair_features = torch.cat(
+            [
+                drug_vector,
+                protein_vector,
+                drug_vector * protein_vector,
+                torch.abs(drug_vector - protein_vector),
+            ],
+            dim=-1,
+        )
+
+        transformed = self.interaction_projection(pair_features)
+        gate = self.gate(pair_features)
+        skip = self.skip_projection(
+            torch.cat([drug_vector, protein_vector], dim=-1)
+        )
+        fused = gate * transformed + (1.0 - gate) * skip
+        return self.output_network(fused)
+
+
+# ---------------------------------------------------------------------------
+# 4. Stage 2: same-target relational residual correction
+# ---------------------------------------------------------------------------
+
+class TargetConditionedRelationEncoder(nn.Module):
+    """
+    Encode an anchor-reference comparison under the shared target context.
+
+    Pairwise features:
+      [z_anchor, z_reference, z_anchor-z_reference,
+       |z_anchor-z_reference|, z_anchor*z_reference, z_target]
+    """
+
+    def __init__(self, pair_dim: int, target_dim: int,
+                 hidden_dim: int, relation_dim: int, dropout: float):
+        super().__init__()
+        input_dim = pair_dim * 5 + target_dim
+        self.network = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, relation_dim),
+            nn.LayerNorm(relation_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, anchor, references, target):
+        reference_count = references.size(1)
+        anchor_expanded = anchor.unsqueeze(1).expand(-1, reference_count, -1)
+        target_expanded = target.unsqueeze(1).expand(-1, reference_count, -1)
+
+        relation_features = torch.cat(
+            [
+                anchor_expanded,
+                references,
+                anchor_expanded - references,
+                torch.abs(anchor_expanded - references),
+                anchor_expanded * references,
+                target_expanded,
+            ],
+            dim=-1,
+        )
+        return self.network(relation_features)
+
+
+class RelationalHeads(nn.Module):
+    """Predict pairwise affinity direction and reference reliability."""
+
+    def __init__(self, relation_dim: int, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.direction_head = nn.Sequential(
+            nn.Linear(relation_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.reliability_head = nn.Sequential(
+            nn.Linear(relation_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, relation_features):
+        direction_logits = self.direction_head(relation_features).squeeze(-1)
+        reliability_logits = self.reliability_head(relation_features).squeeze(-1)
+        return direction_logits, reliability_logits
+
+
+class RelationalCalibration(nn.Module):
+    """Aggregate reliable same-target relations into a gated residual update."""
+
+    def __init__(self, pair_dim: int, relation_dim: int,
+                 hidden_dim: int, config: TRACDTAConfig):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(pair_dim + relation_dim),
+            nn.Linear(pair_dim + relation_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, relation_dim),
+            nn.GELU(),
+        )
+
+        self.delta_head = nn.Linear(relation_dim, 1)
+        self.gate_head = nn.Linear(relation_dim, 1)
+
+        # Initialize the residual branch conservatively.
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.delta_head.bias)
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.zeros_(self.gate_head.bias)
+
+    def forward(self, pair_representation, aggregated_relation,
+                relation_confidence, has_reference):
+        # Detaching the absolute representation keeps Stage 2 from changing Stage 1.
+        hidden = self.trunk(
+            torch.cat([pair_representation.detach(), aggregated_relation], dim=-1)
+        )
+
+        delta = self.delta_head(hidden).squeeze(-1)
+        learned_gate = torch.sigmoid(self.gate_head(hidden).squeeze(-1))
+        gate = relation_confidence.detach() * learned_gate
+        gate = gate * has_reference.to(gate.dtype)
+
+        return delta, gate
+
+
+# ---------------------------------------------------------------------------
+# 5. Integrated TRAC-DTA model
+# ---------------------------------------------------------------------------
+
+class TRACDTAModel(nn.Module):
+    def __init__(self, config: TRACDTAConfig):
+        super().__init__()
+        self.config = config
+
+        # Pretrained sequence representations
+        self.drug_projector = RobustProjector(
+            config.drug_plm_dim, config.hidden_dim,
+            config.projection_dim, config.dropout
+        )
+        self.protein_projector = RobustProjector(
+            config.protein_plm_dim, config.hidden_dim,
+            config.projection_dim, config.dropout
+        )
+
+        # Molecular and protein graph representations
+        self.drug_graph_encoder = GINGATEncoder(
+            config.drug_atom_feature_dim, config.hidden_dim,
+            config.hidden_dim, config.dropout, config.gat_negative_slope
+        )
+        self.protein_graph_encoder = GINGATEncoder(
+            config.protein_residue_feature_dim, config.hidden_dim,
+            config.hidden_dim, config.dropout, config.gat_negative_slope
+        )
+
+        self.pool = AttentionPooling(
+            config.hidden_dim, config.hidden_dim
+        )
+        self.drug_interactive_pool = BidirectionalInteractivePooling(
+            config.hidden_dim
+        )
+        self.protein_interactive_pool = BidirectionalInteractivePooling(
+            config.hidden_dim
+        )
+
+        # Target-conditioned modality fusion
+        self.drug_tcmf = TargetConditionedModalityFusion(
+            config.hidden_dim, config.dropout
+        )
+        self.protein_tcmf = TargetConditionedModalityFusion(
+            config.hidden_dim, config.dropout
+        )
+
+        self.pair_fusion = InteractionAwarePairFusion(
+            config.hidden_dim, config.pair_dim, config.dropout
+        )
+        self.tapc = TargetAwarePrototypeCalibration(
+            config.pair_dim, config.hidden_dim, config
+        )
+
+        # Absolute affinity prediction head
+        self.absolute_head = nn.Sequential(
+            nn.Linear(config.pair_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.calibration_hidden_dim),
+            nn.LayerNorm(config.calibration_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.calibration_hidden_dim, 1),
+        )
+
+        # Relational residual branch
+        self.relation_encoder = TargetConditionedRelationEncoder(
+            config.pair_dim, config.hidden_dim,
+            config.relation_hidden_dim, config.relation_dim,
+            config.dropout
+        )
+        self.relational_heads = RelationalHeads(
+            config.relation_dim, config.relation_head_hidden_dim,
+            config.dropout
+        )
+        self.relational_calibration = RelationalCalibration(
+            config.pair_dim, config.relation_dim,
+            config.calibration_hidden_dim, config
+        )
+
+    def encode_pair(
+        self,
+        drug_plm,
+        drug_plm_mask,
+        protein_plm,
+        protein_plm_mask,
+        drug_graph_nodes,
+        drug_graph_adjacency,
+        drug_graph_adjacency_mask,
+        drug_graph_node_mask,
+        protein_graph_nodes,
+        protein_graph_adjacency,
+        protein_graph_adjacency_mask,
+        protein_graph_node_mask,
+    ):
+        drug_sequence = self.drug_projector(drug_plm)
+        protein_sequence = self.protein_projector(protein_plm)
+
+        drug_graph = self.drug_graph_encoder(
+            drug_graph_nodes, drug_graph_adjacency,
+            drug_graph_adjacency_mask, drug_graph_node_mask
+        )
+        protein_graph = self.protein_graph_encoder(
+            protein_graph_nodes, protein_graph_adjacency,
+            protein_graph_adjacency_mask, protein_graph_node_mask
+        )
+
+        # Global contexts for cross-entity positional pooling
+        drug_sequence_context = self.pool(drug_sequence, drug_plm_mask)
+        protein_sequence_context = self.pool(protein_sequence, protein_plm_mask)
+        drug_graph_context = self.pool(drug_graph, drug_graph_node_mask)
+        protein_graph_context = self.pool(protein_graph, protein_graph_node_mask)
+
+        # Bidirectional Interactive Pooling
+        drug_sequence_vector = self.drug_interactive_pool(
+            drug_sequence, protein_sequence_context, drug_plm_mask
+        )
+        protein_sequence_vector = self.protein_interactive_pool(
+            protein_sequence, drug_sequence_context, protein_plm_mask
+        )
+        drug_graph_vector = self.drug_interactive_pool(
+            drug_graph, protein_graph_context, drug_graph_node_mask
+        )
+        protein_graph_vector = self.protein_interactive_pool(
+            protein_graph, drug_graph_context, protein_graph_node_mask
+        )
+
+        # TCMF: each entity uses the partner's multimodal context
+        drug_vector = self.drug_tcmf(
+            drug_sequence_vector, drug_graph_vector,
+            protein_sequence_vector, protein_graph_vector
+        )
+        protein_vector = self.protein_tcmf(
+            protein_sequence_vector, protein_graph_vector,
+            drug_sequence_vector, drug_graph_vector
+        )
+
+        pair_vector = self.pair_fusion(drug_vector, protein_vector)
+        pair_vector = self.tapc(pair_vector, protein_vector)
+
+        return drug_vector, protein_vector, pair_vector
+
+    def forward(
+        self,
+        *,
+        reference_mask: Optional[torch.Tensor] = None,
+        reference_indices: Optional[torch.Tensor] = None,
+        external_reference_embeddings: Optional[torch.Tensor] = None,
+        absolute_only: bool = False,
+        **pair_inputs,
+    ):
+        drug_vector, protein_vector, pair_vector = self.encode_pair(**pair_inputs)
+        absolute_prediction = self.absolute_head(pair_vector).squeeze(-1)
+
+        if absolute_only:
+            return {
+                "absolute_prediction": absolute_prediction,
+                "drug_representation": drug_vector,
+                "protein_representation": protein_vector,
+                "pair_representation": pair_vector,
+            }
+
+        # Training can index references from the current batch. Validation/test
+        # should provide an embedding bank encoded exclusively from train pairs.
+        if external_reference_embeddings is not None:
+            reference_embeddings = external_reference_embeddings
+        elif reference_indices is not None:
+            reference_embeddings = pair_vector[reference_indices]
+        else:
+            reference_embeddings = None
+
+        if reference_embeddings is None or reference_mask is None:
+            return {
+                "absolute_prediction": absolute_prediction,
+                "final_prediction": absolute_prediction,
+                "gate": torch.zeros_like(absolute_prediction),
+                "delta": torch.zeros_like(absolute_prediction),
+            }
+
+        anchor = pair_vector.detach()
+        references = reference_embeddings.detach()
+        target = protein_vector.detach()
+
+        relation_features = self.relation_encoder(anchor, references, target)
+        direction_logits, reliability_logits = self.relational_heads(
+            relation_features
+        )
+
+        valid = reference_mask.to(reliability_logits.dtype)
+        reliability = torch.sigmoid(reliability_logits) * valid
+
+        valid_count = valid.sum(dim=1).clamp_min(1.0)
+        relation_confidence = reliability.sum(dim=1) / valid_count
+
+        denominator = reliability.sum(dim=1, keepdim=True).clamp_min(
+            torch.finfo(reliability.dtype).eps
+        )
+        aggregated_relation = (
+            relation_features * reliability.unsqueeze(-1)
+        ).sum(dim=1) / denominator
+
+        has_reference = reference_mask.any(dim=1)
+        aggregated_relation = aggregated_relation * has_reference.unsqueeze(-1)
+
+        delta, gate = self.relational_calibration(
+            pair_vector, aggregated_relation,
+            relation_confidence, has_reference
+        )
+
+        # Compute the additive correction in FP32 for numerical stability.
+        final_prediction = (
+            absolute_prediction.float() + gate.float() * delta.float()
+        )
+
+        return {
+            "absolute_prediction": absolute_prediction,
+            "final_prediction": final_prediction,
+            "direction_logits": direction_logits,
+            "reliability_logits": reliability_logits,
+            "relation_confidence": relation_confidence,
+            "gate": gate,
+            "delta": delta,
+            "drug_representation": drug_vector,
+            "protein_representation": protein_vector,
+            "pair_representation": pair_vector,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 6. Learning objectives
+# ---------------------------------------------------------------------------
+
+def pairwise_ranking_loss(prediction, target, margin):
+    """Pairwise ranking objective for the absolute prediction stage."""
+    target_difference = target.unsqueeze(1) - target.unsqueeze(0)
+    prediction_difference = prediction.unsqueeze(1) - prediction.unsqueeze(0)
+
+    valid_pairs = target_difference.abs() > 0
+    pair_loss = F.relu(
+        margin - torch.sign(target_difference) * prediction_difference
+    )
+    return (pair_loss * valid_pairs).sum() / valid_pairs.sum().clamp_min(1)
+
+
+def relational_auxiliary_losses(
+    direction_logits,
+    reliability_logits,
+    anchor_labels,
+    reference_labels,
+    reference_mask,
+    reliability_tau,
+):
+    """
+    Training-only supervision for reference comparisons.
+
+    The affinity labels supervise direction and reliability during training.
+    They are not passed into the Stage-2 prediction branch at inference.
+    """
+    affinity_gap = torch.abs(
+        anchor_labels.unsqueeze(1) - reference_labels
+    )
+    reliability_target = (
+        affinity_gap / (affinity_gap + reliability_tau)
+    ).detach()
+
+    direction_target = (
+        anchor_labels.unsqueeze(1) > reference_labels
+    ).to(direction_logits.dtype)
+
+    valid = reference_mask.to(direction_logits.dtype)
+    direction_weight = reliability_target * valid
+
+    direction_bce = F.binary_cross_entropy_with_logits(
+        direction_logits, direction_target, reduction="none"
+    )
+    direction_loss = (
+        direction_bce * direction_weight
+    ).sum() / direction_weight.sum().clamp_min(1)
+
+    reliability_prediction = torch.sigmoid(reliability_logits)
+    reliability_loss = (
+        (reliability_prediction - reliability_target).square() * valid
+    ).sum() / valid.sum().clamp_min(1)
+
+    return direction_loss, reliability_loss
+
+
+# ---------------------------------------------------------------------------
+# 7. Two-stage optimization protocol (pseudocode)
+# ---------------------------------------------------------------------------
+
+def train_trac_dta(model, training_data, validation_data, config):
+    """
+    PSEUDOCODE — dataset-specific batching, checkpoint I/O, and optimizer
+    settings are intentionally external to this framework file.
+
+    Stage 1: absolute affinity learning
+    -----------------------------------
+    1. Construct drug/protein PLM features and molecular/protein graphs.
+    2. Train the sequence/graph encoders, Bidirectional Interactive Pooling,
+       TCMF, TAPC, pair fusion, and absolute prediction head.
+    3. For each training batch:
+           output = model(batch, absolute_only=True)
+           L_mse  = MSE(output.absolute_prediction, affinity_labels)
+           L_rank = pairwise_ranking_loss(...)
+           L_con  = supervised_contrastive_loss(drug/protein representations)
+           L_stage1 = w_mse*L_mse + w_rank*L_rank + w_con*L_con
+           update Stage-1 parameters
+    4. Select the Stage-1 checkpoint using validation data.
+
+    Stage 2: relational residual refinement
+    ---------------------------------------
+    1. Load the validation-selected Stage-1 checkpoint.
+    2. Freeze all Stage-1 parameters, including the absolute predictor.
+    3. Train only the relation encoder, direction/reliability heads, and
+       relational calibration module.
+    4. Construct reference sets from training interactions sharing the
+       anchor's protein target. Do not use validation/test interactions as
+       references.
+    5. For each training batch:
+           build same-target reference indices and a validity mask
+           output = model(batch, reference_indices, reference_mask)
+           residual_target = affinity_labels - output.absolute_prediction
+           residual_prediction = output.gate * output.delta
+           L_res = MSE(residual_prediction, residual_target)
+           L_dir, L_rel = relational_auxiliary_losses(...)
+           L_stage2 = w_res*L_res + w_dir*L_dir + w_rel*L_rel
+           update only Stage-2 parameters
+    6. Select the Stage-2 checkpoint using validation data.
+
+    Inference
+    ---------
+    1. Encode a reference bank from training interactions only.
+    2. For each query pair, retrieve available same-target reference embeddings.
+    3. Predict the absolute affinity and, when valid references exist, add the
+       reliability-gated relational residual.
+    4. If no valid reference exists, return the absolute prediction.
+
+    The weights, optimizer settings, batch construction, split protocol, and
+    stopping criteria belong in an external experiment configuration.
+    """
+    raise NotImplementedError(
+        "Dataset loading and the experiment-specific optimization loop are pseudocode."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. Data preparation protocol (pseudocode)
+# ---------------------------------------------------------------------------
+
+"""
+DATA PREPARATION — PSEUDOCODE
+
+drug_records      <- load compound identifiers and SMILES
+protein_records   <- load target identifiers and amino-acid sequences
+affinity_matrix   <- load measured drug-target affinity labels
+interaction_table <- convert observed matrix entries into drug-target-label rows
+
+drug_plm_features    <- load or compute pretrained drug token embeddings
+protein_plm_features <- load or compute pretrained protein token embeddings
+
+For each drug:
+    parse SMILES into an atom-bond graph
+    assign atom-level descriptors
+    retain the pretrained token representation and its mask
+
+For each protein:
+    construct a residue graph from the sequence
+    assign residue-level descriptors
+    retain the pretrained token representation and its mask
+
+Split interaction rows according to the selected evaluation protocol.
+
+IMPORTANT REFERENCE POLICY:
+    Stage-2 training references are drawn only from the training partition.
+    Validation/test reference banks contain embeddings of training interactions
+    only. Their affinity labels are not model inputs during prediction.
+"""
+
+
+# ---------------------------------------------------------------------------
+# 9. High-level architecture summary
+# ---------------------------------------------------------------------------
+
+"""
+Drug SMILES / protein sequence
+            |                  |
+      pretrained PLM       pretrained PLM
+            |                  |
+      PLM projection       PLM projection
+            |                  |
+      atom/residue graph  atom/residue graph
+            |                  |
+         GIN + GAT           GIN + GAT
+            |                  |
+    attention pooling   attention pooling
+            |                  |
+ Bidirectional Interactive Pooling
+            |                  |
+      TCMF (partner-conditioned modality allocation)
+            |                  |
+      drug / protein representations
+                    |
+           interaction-aware pair fusion
+                    |
+                  TAPC
+                    |
+          absolute affinity prediction
+                    |
+        frozen absolute prediction pathway
+                    |
+ same-target reference comparison (Stage 2)
+                    |
+       reliability-weighted relation context
+                    |
+         gated relational residual update
+                    |
+             final affinity prediction
+"""
