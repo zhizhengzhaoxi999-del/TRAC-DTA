@@ -161,20 +161,7 @@ python -u trac_dta_seed430_rm2_fixed_analysis.py --export-only
 
 The `--export-only` option requires the corresponding saved checkpoints, split/reference file, and run manifest from a previous run. It does not train a new model.
 
-### Configuration
 
-The main hyperparameters and paths are defined near the beginning of the Python script. The supplied configuration includes:
-
-- Random seed: `1`
-- Batch size: `256`
-- Stage 1 maximum learning rate: `1.8e-4`
-- Stage 1 maximum epochs: `200`
-- Stage 2 maximum learning rate: `1e-4`
-- Stage 2 maximum epochs: `60`
-- Same-target reference count (`K`): `4`
-- Number of TAPC prototypes: `8`
-
-Do not change these values if the goal is to reproduce the supplied seed-430 configuration. Any modification should be reported as a changed experimental setting.
 
 ### Reproducibility notes
 
