@@ -2,17 +2,17 @@
 
 Official research-code repository for **TRAC-DTA: Drug–Target Affinity Prediction**.
 
-This repository currently contains the KIBA random-interaction-split training and analysis script for **seed 430**. The script implements a two-stage training workflow: an absolute affinity predictor followed by target-conditioned relational residual refinement. It also exports matched ABS/FINAL predictions and analysis outputs for TCMF and TAPC.
+This repository currently contains the KIBA random-interaction-split training and analysis script. The script implements a two-stage training workflow: an absolute affinity predictor followed by target-conditioned relational residual refinement. It also exports matched ABS/FINAL predictions and analysis outputs for TCMF and TAPC.
 
 > **Scope and reproducibility note**
 >
-> The code currently included here is the supplied KIBA seed-430 experiment script. It is not, by itself, a complete reproduction package for every experiment reported in the manuscript (for example, all KIBA seeds, DAVIS scaffold splits, cold-start settings, external Human evaluation, and all baselines). Additional scripts/configurations should be added before claiming that the entire paper is fully reproducible from this repository.
+> The code currently included here is the KIBA random-interaction-split experiment script. It is not, by itself, a complete reproduction package for every experiment reported in the manuscript (for example, all KIBA experimental configurations, DAVIS scaffold splits, cold-start settings, external Human evaluation, and all baselines). Additional scripts and configurations should be added before claiming that the entire paper is fully reproducible from this repository.
 
 ## Repository structure
 
 ```text
 TRAC-DTA/
-├── trac_dta_seed430_rm2_fixed_analysis.py
+├── trac-dta.py
 ├── requirements.txt
 ├── LICENSE
 ├── .gitignore
@@ -31,7 +31,7 @@ The `Data/` and `Pretrained_Data/` directories are intentionally kept empty in t
 The supplied script includes:
 
 - Molecular and protein graph encoders based on GIN/GAT layers.
-- Bidirectional interactive pooling for sequence/graph positional readout.
+- Bidirectional Interactive Pooling for sequence/graph positional readout.
 - Target-Conditioned Modality Fusion (TCMF).
 - Target-Conditioned Affinity Prototype Calibration (TAPC).
 - A two-stage training procedure:
@@ -139,10 +139,10 @@ The public repository intentionally contains empty data directories only. Users 
 From the repository root, after preparing all required files:
 
 ```bash
-python -u trac_dta_seed430_rm2_fixed_analysis.py
+python -u trac-dta.py
 ```
 
-The script uses the KIBA random interaction split and seed 430. The nominal split is 80% training, 10% validation, and 10% test. The script:
+The script uses the KIBA random-interaction split. The nominal split is 80% training, 10% validation, and 10% test. The script:
 
 1. Loads the KIBA interaction matrix, drug SMILES, protein sequences, and pretrained features.
 2. Builds or loads graph caches.
@@ -151,17 +151,15 @@ The script uses the KIBA random interaction split and seed 430. The nominal spli
 5. Selects the Stage-1 checkpoint using validation performance and initializes Stage 2 from the validation-selected Best-CI checkpoint.
 6. Freezes the absolute prediction pathway and trains the relational residual modules.
 7. Evaluates and exports ABS/FINAL predictions and TCMF/TAPC analysis outputs.
-8. Creates a results bundle under `Data/KIBA/cache_trac_dta_v31_seed430_rm2_fixed_analysis/`.
+8. Creates a results bundle under the configured KIBA result directory.
 
-A normal run performs training and export automatically. To re-export outputs from checkpoints produced by this exact script, use:
+A normal run performs training and export automatically. To re-export outputs from checkpoints produced by this script, use:
 
 ```bash
-python -u trac_dta_seed430_rm2_fixed_analysis.py --export-only
+python -u trac-dta.py --export-only
 ```
 
 The `--export-only` option requires the corresponding saved checkpoints, split/reference file, and run manifest from a previous run. It does not train a new model.
-
-
 
 ### Reproducibility notes
 
@@ -169,15 +167,11 @@ The `--export-only` option requires the corresponding saved checkpoints, split/r
 - Validation/test reference features are constructed only from training interactions.
 - The validation set is used for checkpoint selection. Test-set monitoring is also present in the supplied training loop; for a strictly blind final evaluation protocol, ensure test results are not used to make training or model-selection decisions.
 - GPU model, driver, CUDA/PyTorch build, and library versions can affect runtime and numerical behavior.
-- Full-paper reproduction requires the corresponding scripts and configurations for the other datasets, seeds, split protocols, and external evaluations. These are not included in this initial repository package.
+- Full-paper reproduction requires the corresponding scripts and configurations for the other datasets, split protocols, and external evaluations. These are not included in this initial repository package.
 
 ## Outputs
 
-The script writes checkpoints, split/reference metadata, prediction exports, diagnostics, and a compressed analysis bundle under:
-
-```text
-Data/KIBA/cache_trac_dta_v31_seed430_rm2_fixed_analysis/
-```
+The script writes checkpoints, split/reference metadata, prediction exports, diagnostics, and a compressed analysis bundle under the configured KIBA result directory.
 
 Graph preprocessing cache files are written under:
 
