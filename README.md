@@ -165,7 +165,7 @@ The `--export-only` option requires the corresponding saved checkpoints, split/r
 
 The main hyperparameters and paths are defined near the beginning of the Python script. The supplied configuration includes:
 
-- Random seed: `430`
+- Random seed: `1`
 - Batch size: `256`
 - Stage 1 maximum learning rate: `1.8e-4`
 - Stage 1 maximum epochs: `200`
